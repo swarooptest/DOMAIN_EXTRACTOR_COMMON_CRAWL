@@ -1,0 +1,256 @@
+import gzip
+import json
+import urllib.request
+import os
+from urllib.parse import urlparse
+import time
+import re
+import csv
+import socket
+from concurrent.futures import ThreadPoolExecutor
+
+def extract_domains_from_direct_url(url, output_file, display_limit=20):
+    """
+    Extract domain and subdomain information from a direct Common Crawl CDX file URL.
+
+    Args:
+        url: Direct URL to the CDX file
+        output_file: Path to output file to save domains
+        display_limit: Number of domains to display in console
+    """
+    domains = set()
+
+    try:
+        # Create a temporary file to store the downloaded gzipped content
+        temp_file = "temp_cc_file.gz"
+
+        # Download the file
+        print(f"Downloading {url}")
+        start_time = time.time()
+        urllib.request.urlretrieve(url, temp_file)
+        download_time = time.time() - start_time
+        print(f"Download completed in {download_time:.2f} seconds")
+
+        # Process the downloaded file
+        print("Extracting domains...")
+        start_time = time.time()
+        domains = process_cdx_file(temp_file)
+        processing_time = time.time() - start_time
+
+        print(f"Extracted {len(domains)} unique domains")
+        print(f"Processing completed in {processing_time:.2f} seconds")
+
+        # Display some of the domains found
+        if domains:
+            print(f"\nSample of domains found (showing up to {display_limit}):")
+            for i, domain in enumerate(sorted(domains)):
+                if i >= display_limit:
+                    print(f"...and {len(domains) - display_limit} more")
+                    break
+                print(f"  - {domain}")
+            print()
+
+        # Remove the temporary file
+        os.remove(temp_file)
+
+    except Exception as e:
+        print(f"Error processing {url}: {e}")
+
+    # Create the CSV file with domain and subdomain information
+    create_domain_csv(domains, output_file)
+
+    # Display some structured domains
+    print("\n=== SAMPLE OF DOMAINS AND SUBDOMAINS ===")
+    display_sample_from_csv(output_file, limit=display_limit)
+
+    print(f"\nCompleted! Found {len(domains)} unique domains.")
+
+    return domains
+
+def process_cdx_file(file_path):
+    """Process a single CDX file and return a set of domains"""
+    domains = set()
+
+    with gzip.open(file_path, 'rt', errors='replace') as f:
+        for line_number, line in enumerate(f):
+            try:
+                # Split the line into SURT, timestamp, and JSON parts
+                line = line.strip()
+
+                # Find the JSON part - it starts after the second space
+                parts = line.split(' ', 2)
+                if len(parts) < 3:
+                    continue
+
+                surt = parts[0]
+                json_str = parts[2]
+
+                # Extract domain from JSON
+                try:
+                    record = json.loads(json_str)
+                    url = record.get('url', '')
+
+                    if url:
+                        parsed_url = urlparse(url)
+                        domain = parsed_url.netloc
+
+                        if domain:
+                            domains.add(domain)
+                except json.JSONDecodeError:
+                    # If JSON parsing fails, try to extract domain from SURT
+                    match = re.match(r'^([^)]+)\)', surt)
+                    if match:
+                        surt_domain = match.group(1)
+                        # Convert SURT domain to normal domain
+                        domain_parts = surt_domain.split(',')
+                        domain = '.'.join(reversed(domain_parts))
+                        domains.add(domain)
+            except Exception as e:
+                if line_number % 100000 == 0:  # Only show occasional errors to reduce output
+                    print(f"Error processing line {line_number}: {e}")
+                continue
+
+            # Show progress
+            if line_number > 0 and line_number % 100000 == 0:
+                print(f"Processed {line_number} lines, found {len(domains)} unique domains so far")
+
+    return domains
+
+def split_domain_parts(domain):
+    """
+    Split a domain into main domain and subdomain parts.
+    Handles common multi-level TLDs.
+    """
+    parts = domain.split('.')
+
+    # Handle common multi-part TLDs
+    common_tlds = ['co.uk', 'com.au', 'co.nz', 'co.jp', 'co.za', 'ac.uk', 'gov.au', 'edu.au']
+
+    if len(parts) >= 3:
+        potential_tld = f"{parts[-2]}.{parts[-1]}"
+        if potential_tld in common_tlds:
+            # It's a multi-part TLD
+            if len(parts) > 3:  # Has subdomain
+                main_domain = f"{parts[-3]}.{parts[-2]}.{parts[-1]}"
+                subdomain = '.'.join(parts[:-3])
+                return main_domain, subdomain
+            else:
+                return f"{parts[-3]}.{parts[-2]}.{parts[-1]}", ""
+        else:
+            # Regular domain
+            if len(parts) > 2:  # Has subdomain
+                main_domain = f"{parts[-2]}.{parts[-1]}"
+                subdomain = '.'.join(parts[:-2])
+                return main_domain, subdomain
+            else:
+                return f"{parts[-2]}.{parts[-1]}", ""
+    elif len(parts) == 2:
+        # Just domain.tld
+        return domain, ""
+    else:
+        # Invalid domain
+        return domain, ""
+
+def get_ip_address(domain):
+    """Resolve domain to IP address"""
+    try:
+        ip = socket.gethostbyname(domain)
+        return ip
+    except socket.gaierror:
+        return "Could not resolve"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def resolve_domain_batch(domains, max_workers=100):
+    """Resolve a batch of domains to IP addresses using threading"""
+    domain_to_ip = {}
+
+    print(f"Resolving IP addresses for {len(domains)} domains (this may take some time)...")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Create a mapping of futures to domains
+        future_to_domain = {executor.submit(get_ip_address, domain): domain for domain in domains}
+
+        # Process as they complete
+        completed = 0
+        for future in future_to_domain:
+            domain = future_to_domain[future]
+            try:
+                ip = future.result()
+                domain_to_ip[domain] = ip
+            except Exception as e:
+                domain_to_ip[domain] = f"Error: {str(e)}"
+
+            completed += 1
+            if completed % 100 == 0:
+                print(f"Resolved {completed}/{len(domains)} domains")
+
+    return domain_to_ip
+
+def create_domain_csv(domains, output_file):
+    """Create a CSV with domain, subdomain and IP address"""
+    print(f"Creating CSV file: {output_file}")
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
+
+    # Resolve IP addresses for all domains
+    domain_to_ip = resolve_domain_batch(domains)
+
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Full Domain', 'Main Domain', 'Subdomain', 'IP Address'])
+
+        for full_domain in sorted(domains):
+            main_domain, subdomain = split_domain_parts(full_domain)
+            ip_address = domain_to_ip.get(full_domain, "Could not resolve")
+            writer.writerow([full_domain, main_domain, subdomain, ip_address])
+
+    print(f"CSV file created successfully with {len(domains)} entries")
+
+def display_sample_from_csv(csv_file, limit=20):
+    """Display a sample of domains from the CSV file"""
+    try:
+        with open(csv_file, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            header = next(reader)  # Skip header
+
+            count = 0
+            for row in reader:
+                if count >= limit:
+                    print(f"...and more entries (showing {limit} of total)")
+                    break
+
+                full_domain, main_domain, subdomain, ip_address = row
+
+                print(f"Domain: {main_domain}")
+                if subdomain:
+                    print(f"  Subdomain: {subdomain}")
+                print(f"  IP Address: {ip_address}")
+                print()
+
+                count += 1
+    except Exception as e:
+        print(f"Error displaying CSV contents: {e}")
+
+# Main execution
+if __name__ == "__main__":
+    # Direct URL to the CDX file
+    cdx_url = "https://data.commoncrawl.org/cc-index/collections/CC-MAIN-2016-07/indexes/cdx-00045.gz"
+
+    # Extract crawl ID from URL for dynamic output file naming
+    import re
+    crawl_id_match = re.search(r'(CC-MAIN-\d{4}-\d{2})', cdx_url)
+    crawl_id = crawl_id_match.group(1) if crawl_id_match else "unknown-crawl"
+
+    # Create directory for crawl ID if it doesn't exist
+    os.makedirs(crawl_id, exist_ok=True)
+
+    # Output file with dynamic naming based on crawl ID
+    output_file = f"{crawl_id}/domains.csv"
+
+    # Number of domains to display in console
+    display_limit = 20
+
+    # Extract domains from the specified CDX file
+    extract_domains_from_direct_url(cdx_url, output_file, display_limit)
