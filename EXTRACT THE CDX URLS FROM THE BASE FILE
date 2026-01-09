@@ -1,0 +1,101 @@
+
+import gzip
+import csv
+import urllib.request
+import os
+
+def download_file(url, local_filename=None):
+    """Download a file from a URL to a local file."""
+    if local_filename is None:
+        local_filename = url.split('/')[-1]
+
+    print(f"Downloading {url} to {local_filename}...")
+
+    if os.path.exists(local_filename):
+        print(f"File {local_filename} already exists, skipping download.")
+        return local_filename
+
+    try:
+        with urllib.request.urlopen(url) as response, open(local_filename, 'wb') as out_file:
+            out_file.write(response.read())
+        print(f"Download complete: {local_filename}")
+        return local_filename
+    except Exception as e:
+        print(f"Error downloading file: {e}")
+        return None
+
+def extract_urls(paths_file):
+    """Extract URLs from the cc-index.paths.gz file."""
+    base_url = "https://data.commoncrawl.org"
+    urls = []
+
+    try:
+        with gzip.open(paths_file, 'rt', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    # Create the full URL by combining the base URL with the path
+                    full_url = f"{base_url}/{line}"
+                    urls.append(full_url)
+    except Exception as e:
+        print(f"Error processing file: {e}")
+
+    return urls
+
+def save_to_csv(urls, csv_filename="cc_index_urls.csv"):
+    """Save URLs to a CSV file."""
+    try:
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
+
+        with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['URL'])  # Header
+            for url in urls:
+                writer.writerow([url])
+        return True
+    except Exception as e:
+        print(f"Error saving to CSV: {e}")
+        return False
+
+def main():
+    # URL of the cc-index.paths.gz file
+    paths_url = "https://data.commoncrawl.org/crawl-data/CC-MAIN-2019-04/cc-index.paths.gz"
+
+    # Extract crawl ID from URL (e.g., "CC-MAIN-2019-04")
+    import re
+    crawl_id_match = re.search(r'(CC-MAIN-\d{4}-\d{2})', paths_url)
+    crawl_id = crawl_id_match.group(1) if crawl_id_match else "unknown-crawl"
+
+    # Local filename to save the downloaded file
+    local_file = "cc-index.paths.gz"
+
+    # Download the file
+    downloaded_file = download_file(paths_url, local_file)
+
+    if downloaded_file:
+        # Extract URLs from the file
+        urls = extract_urls(downloaded_file)
+
+        # Count and print the number of URLs
+        url_count = len(urls)
+        print(f"Found {url_count} URLs in the cc-index.paths.gz file")
+
+        # Print the first few URLs as examples
+        if url_count > 0:
+            print("\nFirst 5 URLs (examples):")
+            for i, url in enumerate(urls[:5]):
+                print(f"{i+1}. {url}")
+
+        # Create directory for crawl ID if it doesn't exist
+        os.makedirs(crawl_id, exist_ok=True)
+
+        # Save URLs to CSV with dynamic name based on crawl ID
+        csv_filename = f"{crawl_id}/{crawl_id}_CC-INDEXES_CDX.csv"
+        save_to_csv(urls, csv_filename)
+        print(f"URLs saved to {csv_filename}")
+    else:
+        print("Failed to download or process the file")
+
+if __name__ == "__main__":
+    main()
