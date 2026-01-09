@@ -1,0 +1,546 @@
+import gzip
+import json
+import urllib.request
+import os
+from urllib.parse import urlparse
+import time
+import re
+import csv
+import socket
+from concurrent.futures import ThreadPoolExecutor
+import argparse
+import hashlib
+import logging
+import sys
+from google.colab import files  # For Colab file upload/download
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("domain_extractor.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def create_progress_tracker(csv_file):
+    """
+    Create a progress tracker file to keep track of processed URLs
+
+    Args:
+        csv_file: Path to the input CSV file
+
+    Returns:
+        Path to the progress tracker file
+    """
+    base_name = os.path.basename(csv_file)
+    name_without_ext = os.path.splitext(base_name)[0]
+    tracker_file = f"{name_without_ext}_progress.txt"
+
+    # Create the file if it doesn't exist
+    if not os.path.exists(tracker_file):
+        with open(tracker_file, 'w') as f:
+            f.write("# URLs that have been processed\n")
+
+    return tracker_file
+
+def get_processed_urls(tracker_file):
+    """
+    Get the list of URLs that have already been processed
+
+    Args:
+        tracker_file: Path to the progress tracker file
+
+    Returns:
+        Set of URLs that have been processed
+    """
+    processed_urls = set()
+
+    if os.path.exists(tracker_file):
+        with open(tracker_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    processed_urls.add(line)
+
+    return processed_urls
+
+def mark_url_as_processed(tracker_file, url):
+    """
+    Mark a URL as processed in the tracker file
+
+    Args:
+        tracker_file: Path to the progress tracker file
+        url: URL that has been processed
+    """
+    with open(tracker_file, 'a') as f:
+        f.write(f"{url}\n")
+
+def generate_url_filename(url):
+    """
+    Generate a unique filename based on the URL
+
+    Args:
+        url: URL to generate filename for
+
+    Returns:
+        A unique filename based on the URL
+    """
+    # Extract crawl ID and index number if possible
+    crawl_id_match = re.search(r'(CC-MAIN-\d{4}-\d{2})', url)
+    index_match = re.search(r'cdx-(\d+)\.gz', url)
+
+    if crawl_id_match and index_match:
+        crawl_id = crawl_id_match.group(1)
+        index_num = index_match.group(1)
+        return f"{crawl_id}_cdx_{index_num}"
+
+    # Fallback to a hash of the URL
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+    parsed_url = urlparse(url)
+    path_parts = parsed_url.path.split('/')
+    file_part = path_parts[-1] if path_parts[-1] else 'index'
+
+    return f"{parsed_url.netloc.replace('.', '_')}_{file_part}_{url_hash}"
+
+def extract_domains_from_direct_url(url, output_file, display_limit=20):
+    """
+    Extract domain and subdomain information from a direct Common Crawl CDX file URL.
+
+    Args:
+        url: Direct URL to the CDX file
+        output_file: Path to output file to save domains
+        display_limit: Number of domains to display in console
+
+    Returns:
+        True if processing was successful, False otherwise
+    """
+    domains = set()
+    temp_file = None
+    success = False
+
+    try:
+        # Create a temporary file to store the downloaded gzipped content
+        temp_file = f"temp_cc_file_{int(time.time())}.gz"
+
+        # Download the file
+        logger.info(f"Downloading {url}")
+        start_time = time.time()
+
+        try:
+            urllib.request.urlretrieve(url, temp_file)
+            download_time = time.time() - start_time
+            logger.info(f"Download completed in {download_time:.2f} seconds")
+
+        except Exception as e:
+            logger.error(f"Failed to download {url}: {e}")
+            return False
+
+        # Process the downloaded file
+        logger.info("Extracting domains...")
+        start_time = time.time()
+
+        try:
+            domains = process_cdx_file(temp_file)
+            processing_time = time.time() - start_time
+
+            logger.info(f"Extracted {len(domains)} unique domains")
+            logger.info(f"Processing completed in {processing_time:.2f} seconds")
+
+            # Display some of the domains found
+            if domains:
+                logger.info(f"\nSample of domains found (showing up to {display_limit}):")
+                for i, domain in enumerate(sorted(domains)):
+                    if i >= display_limit:
+                        logger.info(f"...and {len(domains) - display_limit} more")
+                        break
+                    logger.info(f"  - {domain}")
+
+        except Exception as e:
+            logger.error(f"Failed to process file {temp_file}: {e}")
+            return False
+
+    except Exception as e:
+        logger.error(f"Error processing {url}: {e}")
+        return False
+
+    finally:
+        # Remove the temporary file regardless of success or failure
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+                logger.info(f"Deleted temporary file: {temp_file}")
+            except Exception as e:
+                logger.error(f"Failed to delete temporary file {temp_file}: {e}")
+
+    # Create the CSV file with domain and subdomain information
+    if domains:
+        try:
+            create_domain_csv(domains, output_file)
+
+            # Display some structured domains
+            logger.info("\n=== SAMPLE OF DOMAINS AND SUBDOMAINS ===")
+            display_sample_from_csv(output_file, limit=display_limit)
+
+            logger.info(f"\nCompleted! Found {len(domains)} unique domains.")
+            success = True
+        except Exception as e:
+            logger.error(f"Failed to create CSV file {output_file}: {e}")
+            return False
+    else:
+        logger.warning("No domains were extracted. Output file not created.")
+        return False
+
+    return success
+
+def process_cdx_file(file_path):
+    """Process a single CDX file and return a set of domains"""
+    domains = set()
+
+    with gzip.open(file_path, 'rt', errors='replace') as f:
+        for line_number, line in enumerate(f):
+            try:
+                # Split the line into SURT, timestamp, and JSON parts
+                line = line.strip()
+
+                # Find the JSON part - it starts after the second space
+                parts = line.split(' ', 2)
+                if len(parts) < 3:
+                    continue
+
+                surt = parts[0]
+                json_str = parts[2]
+
+                # Extract domain from JSON
+                try:
+                    record = json.loads(json_str)
+                    url = record.get('url', '')
+
+                    if url:
+                        parsed_url = urlparse(url)
+                        domain = parsed_url.netloc
+
+                        if domain:
+                            domains.add(domain)
+                except json.JSONDecodeError:
+                    # If JSON parsing fails, try to extract domain from SURT
+                    match = re.match(r'^([^)]+)\)', surt)
+                    if match:
+                        surt_domain = match.group(1)
+                        # Convert SURT domain to normal domain
+                        domain_parts = surt_domain.split(',')
+                        domain = '.'.join(reversed(domain_parts))
+                        domains.add(domain)
+            except Exception as e:
+                if line_number % 100000 == 0:  # Only show occasional errors to reduce output
+                    logger.warning(f"Error processing line {line_number}: {e}")
+                continue
+
+            # Show progress
+            if line_number > 0 and line_number % 100000 == 0:
+                logger.info(f"Processed {line_number} lines, found {len(domains)} unique domains so far")
+
+    return domains
+
+def split_domain_parts(domain):
+    """
+    Split a domain into main domain and subdomain parts.
+    Handles common multi-level TLDs.
+    """
+    parts = domain.split('.')
+
+    # Handle common multi-part TLDs
+    common_tlds = ['co.uk', 'com.au', 'co.nz', 'co.jp', 'co.za', 'ac.uk', 'gov.au', 'edu.au']
+
+    if len(parts) >= 3:
+        potential_tld = f"{parts[-2]}.{parts[-1]}"
+        if potential_tld in common_tlds:
+            # It's a multi-part TLD
+            if len(parts) > 3:  # Has subdomain
+                main_domain = f"{parts[-3]}.{parts[-2]}.{parts[-1]}"
+                subdomain = '.'.join(parts[:-3])
+                return main_domain, subdomain
+            else:
+                return f"{parts[-3]}.{parts[-2]}.{parts[-1]}", ""
+        else:
+            # Regular domain
+            if len(parts) > 2:  # Has subdomain
+                main_domain = f"{parts[-2]}.{parts[-1]}"
+                subdomain = '.'.join(parts[:-2])
+                return main_domain, subdomain
+            else:
+                return f"{parts[-2]}.{parts[-1]}", ""
+    elif len(parts) == 2:
+        # Just domain.tld
+        return domain, ""
+    else:
+        # Invalid domain
+        return domain, ""
+
+def get_ip_address(domain):
+    """Resolve domain to IP address with error handling"""
+    try:
+        ip = socket.gethostbyname(domain)
+        return ip
+    except socket.gaierror:
+        return "Could not resolve"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def resolve_domain_batch(domains, max_workers=100):
+    """Resolve a batch of domains to IP addresses using threading with error handling"""
+    domain_to_ip = {}
+
+    logger.info(f"Resolving IP addresses for {len(domains)} domains (this may take some time)...")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Create a mapping of futures to domains
+        future_to_domain = {executor.submit(get_ip_address, domain): domain for domain in domains}
+
+        # Process as they complete
+        completed = 0
+        for future in future_to_domain:
+            domain = future_to_domain[future]
+            try:
+                ip = future.result()
+                domain_to_ip[domain] = ip
+            except Exception as e:
+                logger.warning(f"Error resolving {domain}: {e}")
+                domain_to_ip[domain] = f"Error: {str(e)}"
+
+            completed += 1
+            if completed % 100 == 0:
+                logger.info(f"Resolved {completed}/{len(domains)} domains")
+
+    return domain_to_ip
+
+def create_domain_csv(domains, output_file):
+    """Create a CSV with domain, subdomain and IP address"""
+    logger.info(f"Creating CSV file: {output_file}")
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
+
+    # Resolve IP addresses for all domains
+    domain_to_ip = resolve_domain_batch(domains)
+
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Full Domain', 'Main Domain', 'Subdomain', 'IP Address'])
+
+        for full_domain in sorted(domains):
+            main_domain, subdomain = split_domain_parts(full_domain)
+            ip_address = domain_to_ip.get(full_domain, "Could not resolve")
+            writer.writerow([full_domain, main_domain, subdomain, ip_address])
+
+    logger.info(f"CSV file created successfully with {len(domains)} entries")
+
+def display_sample_from_csv(csv_file, limit=20):
+    """Display a sample of domains from the CSV file"""
+    try:
+        with open(csv_file, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            header = next(reader)  # Skip header
+
+            count = 0
+            for row in reader:
+                if count >= limit:
+                    logger.info(f"...and more entries (showing {limit} of total)")
+                    break
+
+                full_domain, main_domain, subdomain, ip_address = row
+
+                logger.info(f"Domain: {main_domain}")
+                if subdomain:
+                    logger.info(f"  Subdomain: {subdomain}")
+                logger.info(f"  IP Address: {ip_address}")
+                logger.info("")
+
+                count += 1
+    except Exception as e:
+        logger.error(f"Error displaying CSV contents: {e}")
+
+def process_urls_from_csv(input_csv, output_dir="results", display_limit=20, start_url=None):
+    """
+    Process multiple URLs from a CSV file with resumption capability.
+
+    Args:
+        input_csv: Path to input CSV file containing URLs
+        output_dir: Directory to store output files
+        display_limit: Number of domains to display in console for each URL
+        start_url: Optional URL to start processing from (for resumption)
+    """
+    logger.info(f"Processing URLs from {input_csv}")
+
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Create progress tracker
+    tracker_file = create_progress_tracker(input_csv)
+    processed_urls = get_processed_urls(tracker_file)
+
+    if processed_urls:
+        logger.info(f"Found {len(processed_urls)} already processed URLs in tracker file")
+
+    # Read URLs from CSV
+    urls = []
+    start_processing = False if start_url else True
+
+    try:
+        with open(input_csv, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+
+            # Check if URL column exists
+            if "URL" not in reader.fieldnames:
+                logger.error("Column 'URL' not found in the CSV file")
+                return
+
+            # Get URLs from the URL column
+            for row in reader:
+                url = row["URL"].strip()
+                if url and url.startswith("http"):
+                    urls.append(url)
+
+        logger.info(f"Found {len(urls)} URLs to process")
+
+        # Process each URL
+        for i, url in enumerate(urls):
+            # Check if URL has already been processed
+            if url in processed_urls:
+                logger.info(f"[{i+1}/{len(urls)}] Skipping already processed URL: {url}")
+                continue
+
+            # If start_url is specified, skip until we find it
+            if not start_processing:
+                if url == start_url:
+                    start_processing = True
+                    logger.info(f"Starting from specified URL: {url}")
+                else:
+                    logger.info(f"[{i+1}/{len(urls)}] Skipping URL before start point: {url}")
+                    continue
+
+            logger.info(f"\n[{i+1}/{len(urls)}] Processing URL: {url}")
+
+            # Generate output filename based on URL
+            filename = generate_url_filename(url)
+            output_file = f"{output_dir}/{filename}_domains.csv"
+
+            # Process the URL
+            success = extract_domains_from_direct_url(url, output_file, display_limit)
+
+            if success:
+                logger.info(f"Completed processing URL: {url}")
+                logger.info(f"Results saved to: {output_file}")
+
+                # Mark URL as processed
+                mark_url_as_processed(tracker_file, url)
+            else:
+                logger.error(f"Failed to process URL: {url}")
+                logger.info("You can resume from this URL later using the --start-url parameter")
+
+    except Exception as e:
+        logger.error(f"Error processing CSV file: {e}")
+
+def upload_csv_file():
+    """Allow user to upload a CSV file in Colab environment"""
+    print("Please upload your CSV file with URLs...")
+    uploaded = files.upload()
+
+    if not uploaded:
+        return None
+
+    # Get the first uploaded file
+    filename = list(uploaded.keys())[0]
+    return filename
+
+# Function to create a sample CSV if needed
+def create_sample_csv(filename="sample_urls.csv"):
+    """Create a sample CSV file with URLs"""
+    logger.info(f"Creating sample CSV file: {filename}")
+
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['URL'])
+        writer.writerow(['https://data.commoncrawl.org/cc-index/collections/CC-MAIN-2019-04/indexes/cdx-00000.gz'])
+        writer.writerow(['https://data.commoncrawl.org/cc-index/collections/CC-MAIN-2019-04/indexes/cdx-00001.gz'])
+        writer.writerow(['https://data.commoncrawl.org/cc-index/collections/CC-MAIN-2019-04/indexes/cdx-00002.gz'])
+
+    logger.info(f"Sample CSV file created with 3 URLs")
+    return filename
+
+def main():
+    """Main function for Colab execution"""
+    print("Common Crawl Domain Extractor")
+    print("============================")
+
+    # Options menu
+    print("\nOptions:")
+    print("1. Upload a CSV file with URLs")
+    print("2. Create a sample CSV file")
+    print("3. Specify a CSV file path")
+
+    choice = input("\nEnter your choice (1-3): ")
+
+    input_csv = None
+    if choice == '1':
+        input_csv = upload_csv_file()
+        if not input_csv:
+            print("No file uploaded. Exiting.")
+            return
+    elif choice == '2':
+        input_csv = create_sample_csv()
+    elif choice == '3':
+        input_csv = input("Enter the path to your CSV file: ")
+    else:
+        print("Invalid choice. Exiting.")
+        return
+
+    # Get other parameters
+    output_dir = input("Enter output directory (press Enter for 'results'): ")
+    if not output_dir:
+        output_dir = "results"
+
+    display_limit_str = input("Enter display limit for samples (press Enter for default 20): ")
+    display_limit = int(display_limit_str) if display_limit_str else 20
+
+    start_url = input("Enter URL to start from (optional, press Enter to start from beginning): ")
+    if not start_url:
+        start_url = None
+
+    # Process URLs
+    print(f"\nProcessing URLs from {input_csv}")
+    print(f"Results will be saved to {output_dir}")
+
+    process_urls_from_csv(input_csv, output_dir, display_limit, start_url)
+
+    print("\nProcessing complete!")
+    print(f"Check the {output_dir} directory for results.")
+
+# This will run when the script is executed directly in Colab
+if __name__ == "__main__":
+    # If running in Colab, use the interactive main function
+    try:
+        import google.colab
+        # Running in Colab, use interactive interface
+        main()
+    except ImportError:
+        # Not running in Colab, use command line arguments
+        parser = argparse.ArgumentParser(description='Extract domains from Common Crawl CDX files')
+        parser.add_argument('--input', '-i', type=str, required=True, help='Input CSV file containing URLs in column named "URL"')
+        parser.add_argument('--output', '-o', type=str, help='Output directory', default='results')
+        parser.add_argument('--limit', '-l', type=int, help='Display limit for domains', default=20)
+        parser.add_argument('--start-url', '-s', type=str, help='URL to start processing from (for resumption)')
+
+        args = parser.parse_args()
+
+        logger.info("=== Domain Extractor ===")
+        logger.info(f"Input file: {args.input}")
+        logger.info(f"Output directory: {args.output}")
+        logger.info(f"Display limit: {args.limit}")
+        if args.start_url:
+            logger.info(f"Starting from URL: {args.start_url}")
+
+        # Process URLs from the CSV file
+        process_urls_from_csv(args.input, args.output, args.limit, args.start_url)
