@@ -1,0 +1,506 @@
+import pandas as pd
+import requests
+import time
+import json
+from google.colab import files
+import io
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
+import os
+from datetime import datetime
+import csv
+import asyncio
+import aiohttp
+from collections import defaultdict
+import hashlib
+
+class FastOTXVerifier:
+    def __init__(self, api_key, max_workers=20):
+        self.api_key = api_key
+        self.base_url = "https://otx.alienvault.com/api/v1"
+        self.headers = {
+            'X-OTX-API-KEY': api_key,
+            'Content-Type': 'application/json'
+        }
+        self.max_workers = max_workers
+
+        # Aggressive caching
+        self.domain_cache = {}
+        self.ip_cache = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+        # Rate limiting - more aggressive
+        self.request_semaphore = threading.Semaphore(15)  # 15 concurrent requests
+        self.last_requests = []
+        self.lock = threading.Lock()
+
+        # Session pool
+        self.session_pool = []
+        for _ in range(max_workers):
+            session = requests.Session()
+            session.headers.update(self.headers)
+            self.session_pool.append(session)
+        self.session_index = 0
+
+    def get_session(self):
+        """Get session from pool"""
+        with self.lock:
+            session = self.session_pool[self.session_index]
+            self.session_index = (self.session_index + 1) % len(self.session_pool)
+            return session
+
+    def rate_limit(self):
+        """Smart rate limiting"""
+        with self.lock:
+            now = time.time()
+            # Keep only requests from last second
+            self.last_requests = [t for t in self.last_requests if now - t < 1.0]
+
+            # If we've made too many requests, wait
+            if len(self.last_requests) >= 10:  # 10 requests per second max
+                sleep_time = 1.0 - (now - self.last_requests[0])
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+            self.last_requests.append(now)
+
+    def get_cache_key(self, item_type, item):
+        """Generate cache key"""
+        return f"{item_type}:{hashlib.md5(str(item).encode()).hexdigest()}"
+
+    def check_domain_fast(self, domain):
+        """Fast domain check with caching"""
+        try:
+            if not domain or str(domain).lower() in ['nan', 'null', '', 'none']:
+                return {"status": "skipped", "pulse_count": 0, "threats": []}
+
+            # Clean domain
+            domain = str(domain).replace('http://', '').replace('https://', '').split('/')[0].strip().lower()
+            if not domain:
+                return {"status": "skipped", "pulse_count": 0, "threats": []}
+
+            # Check cache first
+            cache_key = self.get_cache_key('domain', domain)
+            if cache_key in self.domain_cache:
+                self.cache_hits += 1
+                return self.domain_cache[cache_key]
+
+            self.cache_misses += 1
+
+            # Rate limit
+            self.rate_limit()
+
+            # Make request
+            session = self.get_session()
+            url = f"{self.base_url}/indicators/domain/{domain}/general"
+
+            with self.request_semaphore:
+                response = session.get(url, timeout=5)
+
+            if response.status_code == 200:
+                data = response.json()
+                result = self.analyze_domain_response(data)
+            elif response.status_code == 404:
+                result = {"status": "safe", "pulse_count": 0, "threats": []}
+            else:
+                result = {"status": "error", "pulse_count": 0, "threats": []}
+
+            # Cache result
+            self.domain_cache[cache_key] = result
+            return result
+
+        except Exception as e:
+            result = {"status": "error", "pulse_count": 0, "threats": []}
+            # Cache errors too to avoid retrying
+            cache_key = self.get_cache_key('domain', domain)
+            self.domain_cache[cache_key] = result
+            return result
+
+    def check_ip_fast(self, ip):
+        """Fast IP check with caching"""
+        try:
+            if not ip or str(ip).lower() in ['nan', 'null', '', 'none']:
+                return {"status": "skipped", "pulse_count": 0, "threats": []}
+
+            ip = str(ip).strip()
+            if not self.is_valid_ip(ip):
+                return {"status": "skipped", "pulse_count": 0, "threats": []}
+
+            # Check cache first
+            cache_key = self.get_cache_key('ip', ip)
+            if cache_key in self.ip_cache:
+                self.cache_hits += 1
+                return self.ip_cache[cache_key]
+
+            self.cache_misses += 1
+
+            # Rate limit
+            self.rate_limit()
+
+            # Make request
+            session = self.get_session()
+            url = f"{self.base_url}/indicators/IPv4/{ip}/general"
+
+            with self.request_semaphore:
+                response = session.get(url, timeout=5)
+
+            if response.status_code == 200:
+                data = response.json()
+                result = self.analyze_ip_response(data)
+            elif response.status_code == 404:
+                result = {"status": "safe", "pulse_count": 0, "threats": []}
+            else:
+                result = {"status": "error", "pulse_count": 0, "threats": []}
+
+            # Cache result
+            self.ip_cache[cache_key] = result
+            return result
+
+        except Exception as e:
+            result = {"status": "error", "pulse_count": 0, "threats": []}
+            # Cache errors too
+            cache_key = self.get_cache_key('ip', ip)
+            self.ip_cache[cache_key] = result
+            return result
+
+    def is_valid_ip(self, ip):
+        """Fast IP validation"""
+        try:
+            parts = ip.split('.')
+            return len(parts) == 4 and all(0 <= int(part) <= 255 for part in parts)
+        except:
+            return False
+
+    def analyze_domain_response(self, data):
+        """Fast domain analysis"""
+        pulse_count = data.get('pulse_info', {}).get('count', 0)
+
+        if pulse_count == 0:
+            return {"status": "safe", "pulse_count": 0, "threats": []}
+
+        # Quick threat detection
+        pulses = data.get('pulse_info', {}).get('pulses', [])[:5]  # Only check first 5
+
+        malicious_keywords = ['malware', 'phishing', 'botnet', 'ransomware', 'trojan']
+        suspicious_keywords = ['suspicious', 'scan', 'probe']
+
+        threats = []
+        threat_level = "safe"
+
+        for pulse in pulses:
+            pulse_name = pulse.get('name', '').lower()
+            tags = ' '.join(pulse.get('tags', [])).lower()
+
+            # Quick keyword matching
+            for keyword in malicious_keywords:
+                if keyword in pulse_name or keyword in tags:
+                    threat_level = "malicious"
+                    threats.append(keyword)
+                    break
+
+            if threat_level != "malicious":
+                for keyword in suspicious_keywords:
+                    if keyword in pulse_name or keyword in tags:
+                        threat_level = "suspicious"
+                        threats.append(keyword)
+                        break
+
+        return {
+            "status": threat_level,
+            "pulse_count": pulse_count,
+            "threats": list(set(threats))
+        }
+
+    def analyze_ip_response(self, data):
+        """Fast IP analysis"""
+        pulse_count = data.get('pulse_info', {}).get('count', 0)
+
+        if pulse_count == 0:
+            return {"status": "safe", "pulse_count": 0, "threats": []}
+
+        # Quick threat detection
+        pulses = data.get('pulse_info', {}).get('pulses', [])[:5]  # Only check first 5
+
+        malicious_keywords = ['malware', 'botnet', 'c2', 'command', 'control']
+        suspicious_keywords = ['suspicious', 'scan', 'probe']
+
+        threats = []
+        threat_level = "safe"
+
+        for pulse in pulses:
+            pulse_name = pulse.get('name', '').lower()
+            tags = ' '.join(pulse.get('tags', [])).lower()
+
+            # Quick keyword matching
+            for keyword in malicious_keywords:
+                if keyword in pulse_name or keyword in tags:
+                    threat_level = "malicious"
+                    threats.append(keyword)
+                    break
+
+            if threat_level != "malicious":
+                for keyword in suspicious_keywords:
+                    if keyword in pulse_name or keyword in tags:
+                        threat_level = "suspicious"
+                        threats.append(keyword)
+                        break
+
+        return {
+            "status": threat_level,
+            "pulse_count": pulse_count,
+            "threats": list(set(threats))
+        }
+
+    def get_cache_stats(self):
+        """Get cache statistics"""
+        total = self.cache_hits + self.cache_misses
+        hit_rate = (self.cache_hits / total * 100) if total > 0 else 0
+        return {
+            'hits': self.cache_hits,
+            'misses': self.cache_misses,
+            'hit_rate': hit_rate,
+            'domain_cache_size': len(self.domain_cache),
+            'ip_cache_size': len(self.ip_cache)
+        }
+
+def process_row_fast(verifier, row_data):
+    """Process single row with optimizations"""
+    domain = str(row_data.get('Full Domain', '')).strip() if pd.notna(row_data.get('Full Domain')) else ""
+    ip_address = str(row_data.get('IP Address', '')).strip() if pd.notna(row_data.get('IP Address')) else ""
+
+    # Quick skip for obviously empty data
+    if not domain and not ip_address:
+        return {
+            'original_domain': domain,
+            'ip_address': ip_address,
+            'domain_status': 'skipped',
+            'ip_status': 'skipped',
+            'overall_risk': 'UNKNOWN'
+        }
+
+    # Process concurrently
+    domain_result = verifier.check_domain_fast(domain) if domain else {"status": "skipped", "pulse_count": 0, "threats": []}
+    ip_result = verifier.check_ip_fast(ip_address) if ip_address else {"status": "skipped", "pulse_count": 0, "threats": []}
+
+    # Determine overall risk quickly
+    if domain_result['status'] == 'malicious' or ip_result['status'] == 'malicious':
+        overall_risk = 'HIGH'
+    elif domain_result['status'] == 'suspicious' or ip_result['status'] == 'suspicious':
+        overall_risk = 'MEDIUM'
+    elif domain_result['status'] == 'safe' and ip_result['status'] == 'safe':
+        overall_risk = 'LOW'
+    else:
+        overall_risk = 'UNKNOWN'
+
+    return {
+        'original_domain': domain,
+        'main_domain': row_data.get('Main Domain', ''),
+        'subdomain': row_data.get('Subdomain', ''),
+        'ip_address': ip_address,
+        'domain_status': domain_result['status'],
+        'domain_threats': ', '.join(domain_result['threats']),
+        'domain_pulse_count': domain_result['pulse_count'],
+        'ip_status': ip_result['status'],
+        'ip_threats': ', '.join(ip_result['threats']),
+        'ip_pulse_count': ip_result['pulse_count'],
+        'overall_risk': overall_risk
+    }
+
+def process_batch_parallel(verifier, batch_data, batch_num, total_batches):
+    """Process batch with maximum parallelism"""
+    print(f"🚀 Processing batch {batch_num}/{total_batches} ({len(batch_data)} rows)")
+
+    results = []
+
+    # Use ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=verifier.max_workers) as executor:
+        # Submit all rows in batch
+        future_to_row = {
+            executor.submit(process_row_fast, verifier, row): idx
+            for idx, (_, row) in enumerate(batch_data.iterrows())
+        }
+
+        # Collect results as they complete
+        for future in as_completed(future_to_row):
+            try:
+                result = future.result(timeout=10)
+                results.append(result)
+            except Exception as e:
+                # Add error result
+                results.append({
+                    'original_domain': 'ERROR',
+                    'ip_address': 'ERROR',
+                    'domain_status': 'error',
+                    'ip_status': 'error',
+                    'overall_risk': 'ERROR'
+                })
+
+    return results
+
+def main():
+    print("⚡ ULTRA-FAST Domain & IP Security Verifier")
+    print("🚀 Optimized for 300k-400k rows with aggressive caching")
+    print("=" * 70)
+
+    # Configuration for speed
+    BATCH_SIZE = 2000  # Larger batches
+    MAX_WORKERS = 20   # More workers
+    CHECKPOINT_INTERVAL = 10000  # Less frequent checkpoints
+
+    # Get API key
+    api_key = input("Enter your AlienVault OTX API Key: ").strip()
+    if not api_key:
+        print("❌ API key is required!")
+        return
+
+    # Speed configuration
+    print("\n⚡ Speed Configuration:")
+    print(f"✅ Concurrent workers: {MAX_WORKERS}")
+    print(f"✅ Batch size: {BATCH_SIZE}")
+    print(f"✅ Aggressive caching: Enabled")
+    print(f"✅ Rate limit: 10 req/sec per worker")
+
+    # Initialize fast verifier
+    verifier = FastOTXVerifier(api_key, max_workers=MAX_WORKERS)
+
+    # Upload CSV
+    print(f"\n📁 Upload your CSV file:")
+    uploaded = files.upload()
+
+    if not uploaded:
+        print("❌ No file uploaded!")
+        return
+
+    filename = list(uploaded.keys())[0]
+
+    try:
+        start_time = time.time()
+
+        # Fast CSV loading
+        print("⚡ Fast loading CSV...")
+        df = pd.read_csv(io.BytesIO(uploaded[filename]))
+
+        total_rows = len(df)
+        print(f"✅ Loaded {total_rows:,} rows in {time.time()-start_time:.1f}s")
+
+        # Display column information
+        print(f"\n📊 CSV Columns detected:")
+        for i, col in enumerate(df.columns):
+            print(f"  {i+1}. '{col}'")
+
+        # Validate columns - FIXED: Check for correct column names
+        required_columns = ['Full Domain', 'IP Address']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+
+        if missing_columns:
+            print(f"❌ Required columns missing: {missing_columns}")
+            print(f"❌ Available columns: {list(df.columns)}")
+            return
+
+        print("✅ All required columns found!")
+
+        # Memory optimization
+        df = df.fillna('')  # Replace NaN with empty strings
+
+        # Pre-analysis for duplicates
+        print("🔍 Analyzing data for optimization...")
+        unique_domains = df['Full Domain'].nunique()
+        unique_ips = df['IP Address'].nunique()
+
+        duplicate_savings = total_rows - unique_domains - unique_ips
+        print(f"📊 Unique domains: {unique_domains:,}")
+        print(f"📊 Unique IPs: {unique_ips:,}")
+        print(f"💡 Cache will save ~{duplicate_savings:,} API calls")
+
+        # Calculate batches
+        total_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
+        print(f"\n🚀 Processing {total_batches} batches of {BATCH_SIZE} rows each")
+
+        # Setup output
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = f"fast_verification_results_{timestamp}.csv"
+
+        all_results = []
+        processed_rows = 0
+
+        # Process all batches
+        for batch_num in range(1, total_batches + 1):
+            batch_start_time = time.time()
+
+            start_idx = (batch_num - 1) * BATCH_SIZE
+            end_idx = min(start_idx + BATCH_SIZE, total_rows)
+            batch_data = df.iloc[start_idx:end_idx]
+
+            # Process batch in parallel
+            batch_results = process_batch_parallel(verifier, batch_data, batch_num, total_batches)
+            all_results.extend(batch_results)
+            processed_rows += len(batch_results)
+
+            # Performance stats
+            batch_time = time.time() - batch_start_time
+            batch_rate = len(batch_results) / batch_time if batch_time > 0 else 0
+
+            # Overall progress
+            progress = (processed_rows / total_rows) * 100
+            elapsed = time.time() - start_time
+            overall_rate = processed_rows / elapsed if elapsed > 0 else 0
+            eta = (total_rows - processed_rows) / overall_rate if overall_rate > 0 else 0
+
+            # Cache stats
+            cache_stats = verifier.get_cache_stats()
+
+            print(f"✅ Batch {batch_num} complete: {batch_rate:.0f} rows/sec")
+            print(f"📈 Overall: {progress:.1f}% ({processed_rows:,}/{total_rows:,}) - {overall_rate:.0f} rows/sec")
+            print(f"⏱️ ETA: {eta/60:.1f} min | Cache hit rate: {cache_stats['hit_rate']:.1f}%")
+
+            # Quick checkpoint for very large files
+            if processed_rows % CHECKPOINT_INTERVAL == 0:
+                checkpoint_file = f"checkpoint_{timestamp}.csv"
+                pd.DataFrame(all_results).to_csv(checkpoint_file, index=False)
+                print(f"💾 Checkpoint: {processed_rows:,} rows saved")
+
+            # Memory management
+            del batch_data, batch_results
+            gc.collect()
+
+        # Final results
+        total_time = time.time() - start_time
+        final_rate = processed_rows / total_time
+
+        print(f"\n🎉 PROCESSING COMPLETE!")
+        print(f"⚡ Total time: {total_time/60:.1f} minutes")
+        print(f"🚀 Average rate: {final_rate:.0f} rows/minute")
+        print(f"💾 Cache efficiency: {cache_stats['hit_rate']:.1f}% hit rate")
+
+        # Quick summary
+        results_df = pd.DataFrame(all_results)
+        risk_counts = results_df['overall_risk'].value_counts()
+
+        print(f"\n📊 SECURITY SUMMARY:")
+        for risk, count in risk_counts.items():
+            emoji = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(risk, "⚪")
+            print(f"{emoji} {risk}: {count:,} ({count/total_rows*100:.1f}%)")
+
+        # Save and download
+        print(f"\n💾 Saving results...")
+        results_df.to_csv(output_file, index=False)
+
+        print(f"📥 Downloading {output_file}...")
+        files.download(output_file)
+
+        print(f"\n✅ VERIFICATION COMPLETE!")
+        print(f"🏆 Processed {total_rows:,} rows in {total_time/60:.1f} minutes")
+
+    except Exception as e:
+        print(f"❌ Error: {str(e)}")
+        # Emergency save
+        if 'all_results' in locals() and all_results:
+            emergency_file = f"emergency_save_{int(time.time())}.csv"
+            pd.DataFrame(all_results).to_csv(emergency_file, index=False)
+            files.download(emergency_file)
+            print(f"💾 Emergency save: {len(all_results)} results")
+
+if __name__ == "__main__":
+    main()
